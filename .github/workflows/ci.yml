@@ -1,0 +1,331 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    name: Validate plugin
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Resolve Grok CLI version
+        id: grok-version
+        run: |
+          echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+          version="$(curl -fsSL https://x.ai/cli/stable | tr -d '[:space:]')"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9._]+)?$'; then
+            echo "Failed to resolve Grok CLI version from https://x.ai/cli/stable" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Grok CLI
+        id: cache-grok
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.grok/bin
+            ~/.grok/downloads
+          key: grok-cli-${{ runner.os }}-${{ runner.arch }}-${{ steps.grok-version.outputs.version }}
+
+      - name: Install Grok CLI
+        if: steps.cache-grok.outputs.cache-hit != 'true'
+        run: curl -fsSL https://x.ai/cli/install.sh | bash -s "${{ steps.grok-version.outputs.version }}"
+
+      - name: Verify Grok CLI version
+        run: grok --version
+
+      - name: Validate plugin with Grok CLI
+        run: |
+          GROK_HOME="$(mktemp -d)"
+          trap 'rm -rf "$GROK_HOME"' EXIT
+          HOME="$GROK_HOME" grok plugin validate .
+          HOME="$GROK_HOME" grok plugin install . --trust
+          HOME="$GROK_HOME" grok plugin list --json > "$GROK_HOME/plugins.json"
+          plugin_name="$(jq -r '.name' plugin.json)"
+          installed_path="$(jq -r --arg name "$plugin_name" '.[] | select(.status == "installed" and .name == $name) | .path' "$GROK_HOME/plugins.json")"
+          if [ -z "$installed_path" ] || [ "$installed_path" = "null" ]; then
+            echo "grok plugin list --json did not include \"${plugin_name}\"" >&2
+            exit 1
+          fi
+          HOME="$GROK_HOME" grok plugin validate "$installed_path"
+          HOME="$GROK_HOME" grok inspect --json > "$GROK_HOME/inspect.json"
+          GROK_PLUGINS_JSON="$GROK_HOME/plugins.json" GROK_INSPECT_JSON="$GROK_HOME/inspect.json" bun -e '
+            import { readdirSync, readFileSync, existsSync, statSync } from "node:fs";
+            import { join, basename } from "node:path";
+
+            const errors = [];
+            const fail = (msg) => errors.push(msg);
+
+            const pluginJson = JSON.parse(readFileSync("plugin.json", "utf8"));
+
+            const allowedPluginKeys = new Set([
+              "$schema",
+              "name",
+              "version",
+              "description",
+              "author",
+              "homepage",
+              "repository",
+              "license",
+              "keywords",
+              "extensions",
+            ]);
+            for (const key of Object.keys(pluginJson)) {
+              if (!allowedPluginKeys.has(key)) {
+                fail(`plugin.json contains unsupported key "${key}"`);
+              }
+            }
+            if (pluginJson.$schema !== "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json") {
+              fail(`plugin.json $schema must be https://agent-plugins.org/schemas/1.0.0/plugin.schema.json`);
+            }
+            if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(pluginJson.name ?? "")) {
+              fail(`plugin.json has invalid name "${pluginJson.name}"`);
+            }
+            for (const field of ["name", "version", "description"]) {
+              if (!pluginJson[field] || typeof pluginJson[field] !== "string") {
+                fail(`plugin.json missing string field "${field}"`);
+              }
+            }
+
+            const parseFrontmatter = (filePath) => {
+              const content = readFileSync(filePath, "utf8");
+              const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+              if (!match) {
+                fail(`${filePath}: missing YAML frontmatter`);
+                return null;
+              }
+              if (Buffer.byteLength(match[1], "utf8") > 4096) {
+                fail(`${filePath}: frontmatter exceeds 4096 bytes`);
+              }
+              return match[1];
+            };
+
+            const unquote = (raw) => {
+              const value = String(raw ?? "").trim();
+              if (value.length >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+                return value.slice(1, -1);
+              }
+              return value;
+            };
+
+            const normalizeSkillName = (raw) =>
+              unquote(raw)
+                .toLowerCase()
+                .replace(/[\s_.]+/g, "-")
+                .replace(/[^a-z0-9-]/g, "")
+                .replace(/-+/g, "-")
+                .replace(/^-|-$/g, "");
+
+            const descriptionText = (fm) => {
+              const lines = fm.split(/\r?\n/);
+              for (let i = 0; i < lines.length; i++) {
+                const match = lines[i].match(/^description:\s*(.*)$/);
+                if (!match) continue;
+                let value = unquote(match[1]);
+                if (value === ">" || value === ">-" || value === "|" || value === "|-" || value === "") {
+                  const parts = [];
+                  for (let j = i + 1; j < lines.length; j++) {
+                    if (!/^\s+/.test(lines[j])) break;
+                    parts.push(lines[j].trim());
+                  }
+                  value = parts.join(" ").trim();
+                }
+                return value;
+              }
+              return "";
+            };
+
+            const validateSkillDir = (skillsRoot) => {
+              const dirs = readdirSync(skillsRoot, { withFileTypes: true })
+                .filter((d) => d.isDirectory())
+                .map((d) => d.name)
+                .sort();
+              for (const dir of dirs) {
+                const skillFile = join(skillsRoot, dir, "SKILL.md");
+                if (!existsSync(skillFile)) {
+                  fail(`${skillsRoot}/${dir}: missing SKILL.md`);
+                  continue;
+                }
+                const fm = parseFrontmatter(skillFile);
+                if (!fm) continue;
+                const nameMatch = fm.match(/^name:\s*(.+)$/m);
+                const skillName = normalizeSkillName(nameMatch?.[1] ?? "");
+                if (!skillName || skillName !== dir) {
+                  fail(`${skillFile}: frontmatter name "${nameMatch?.[1]?.trim()}" normalizes to "${skillName}", which does not match directory "${dir}"`);
+                }
+                if (skillName.length > 64) {
+                  fail(`${skillFile}: normalized name exceeds 64 characters`);
+                }
+                const description = descriptionText(fm);
+                if (!description) {
+                  fail(`${skillFile}: missing description in frontmatter`);
+                } else if (description.length > 1024) {
+                  fail(`${skillFile}: description exceeds 1024 characters`);
+                }
+              }
+              return dirs;
+            };
+
+            const expectedSkills = validateSkillDir("skills");
+            for (const autoEntry of readdirSync("automations", { withFileTypes: true })) {
+              if (!autoEntry.isDirectory()) continue;
+              const autoSkillsRoot = join("automations", autoEntry.name, "skills");
+              if (existsSync(autoSkillsRoot) && statSync(autoSkillsRoot).isDirectory()) {
+                validateSkillDir(autoSkillsRoot);
+              }
+            }
+
+            const expectedAgents = readdirSync("agents")
+              .filter((f) => f.endsWith(".md"))
+              .sort();
+            for (const agentFile of expectedAgents) {
+              const fullPath = join("agents", agentFile);
+              const fm = parseFrontmatter(fullPath);
+              if (!fm) continue;
+              const expectedName = basename(agentFile, ".md");
+              const nameMatch = fm.match(/^name:\s*(.+)$/m);
+              const agentName = unquote(nameMatch?.[1] ?? "");
+              if (agentName !== expectedName) {
+                fail(`${fullPath}: frontmatter name "${agentName}" does not match "${expectedName}"`);
+              }
+              if (!descriptionText(fm)) {
+                fail(`${fullPath}: missing description in frontmatter`);
+              }
+              if (/^mcpServers\s*:/m.test(fm) || /^hooks\s*:/m.test(fm)) {
+                fail(`${fullPath}: plugin agents cannot declare mcpServers or hooks`);
+              }
+              if (/^permissionMode\s*:\s*bypassPermissions\s*$/m.test(fm)) {
+                fail(`${fullPath}: plugin agents cannot set permissionMode bypassPermissions`);
+              }
+            }
+
+            const toKebab = (s) =>
+              s
+                .toLowerCase()
+                .replace(/[^a-z0-9\s-]/g, "")
+                .trim()
+                .replace(/\s+/g, "-");
+
+            const potetoSkill = readFileSync("skills/poteto-mode/SKILL.md", "utf8");
+            const principlesSection = potetoSkill.split("## Principles")[1]?.split("## Autonomy")[0] ?? "";
+            const playbooksSection = potetoSkill.split("## Playbooks")[1] ?? "";
+
+            const indexedPrinciples = new Set();
+            for (const line of principlesSection.split(/\r?\n/)) {
+              const m = line.match(/^- \*\*([^*]+?)\.?\*\*(?: \(\*\*(principle-[a-z0-9-]+)\*\*\))?/);
+              if (m) {
+                indexedPrinciples.add(m[2] ?? `principle-${toKebab(m[1])}`);
+              }
+            }
+            const diskPrinciples = new Set(expectedSkills.filter((s) => s.startsWith("principle-")));
+            for (const p of indexedPrinciples) {
+              if (!diskPrinciples.has(p)) fail(`skills/poteto-mode/SKILL.md references missing principle skill "${p}"`);
+            }
+            for (const p of diskPrinciples) {
+              if (!indexedPrinciples.has(p)) fail(`skills/${p} is not indexed in skills/poteto-mode/SKILL.md`);
+            }
+
+            const indexedPlaybooks = new Set();
+            for (const line of playbooksSection.split(/\r?\n/)) {
+              const m = line.match(/^- \*\*([^*]+?)\.\*\*(?:.*?File: `playbooks\/([^`]+)`)?/);
+              if (m) {
+                indexedPlaybooks.add(m[2] ?? `${toKebab(m[1])}.md`);
+              }
+            }
+            const diskPlaybooks = new Set(readdirSync("skills/poteto-mode/playbooks").filter((f) => f.endsWith(".md")));
+            for (const pb of indexedPlaybooks) {
+              if (!diskPlaybooks.has(pb)) fail(`skills/poteto-mode/SKILL.md references missing playbook "playbooks/${pb}"`);
+            }
+            for (const pb of diskPlaybooks) {
+              if (!indexedPlaybooks.has(pb)) fail(`skills/poteto-mode/playbooks/${pb} is not indexed in skills/poteto-mode/SKILL.md`);
+            }
+
+            const installedList = JSON.parse(readFileSync(process.env.GROK_PLUGINS_JSON, "utf8"));
+            const installed = installedList.find((p) => p.status === "installed" && p.name === pluginJson.name);
+            if (!installed) {
+              fail(`grok plugin list --json did not include "${pluginJson.name}"`);
+            } else if (installed.version !== pluginJson.version) {
+              fail(`Installed plugin version "${installed.version}" !== "${pluginJson.version}"`);
+            }
+
+            const inspect = JSON.parse(readFileSync(process.env.GROK_INSPECT_JSON, "utf8"));
+            const loadedPlugin = (inspect.plugins ?? []).find((p) => p.name === pluginJson.name);
+            if (!loadedPlugin) {
+              fail(`grok inspect --json did not include "${pluginJson.name}"`);
+            } else if (!loadedPlugin.enabled) {
+              fail(`Installed plugin "${pluginJson.name}" is not enabled`);
+            }
+
+            const isThisPlugin = (source) =>
+              source && source.type === "plugin" && source.plugin_name === pluginJson.name;
+            const prefix = `${pluginJson.name}:`;
+            const loadedSkills = (inspect.skills ?? [])
+              .filter((skill) => isThisPlugin(skill.source))
+              .map((skill) => skill.name)
+              .sort();
+            const loadedAgents = (inspect.agents ?? [])
+              .filter((agent) => isThisPlugin(agent.source))
+              .map((agent) => {
+                const name = String(agent.name);
+                return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+              })
+              .sort();
+            const expectedAgentIds = expectedAgents.map((name) => basename(name, ".md"));
+            if (JSON.stringify(loadedSkills) !== JSON.stringify(expectedSkills)) {
+              fail(`Loaded skills mismatch: expected ${expectedSkills.length}, got ${loadedSkills.length}`);
+            }
+            if (JSON.stringify(loadedAgents) !== JSON.stringify(expectedAgentIds)) {
+              fail(`Loaded agents mismatch: expected ${JSON.stringify(expectedAgentIds)}, got ${JSON.stringify(loadedAgents)}`);
+            }
+
+            if (errors.length > 0) {
+              for (const err of errors) console.error(`ERROR: ${err}`);
+              process.exit(1);
+            }
+            console.log(`Validated ${expectedSkills.length} skills, ${expectedAgents.length} agents, and ${diskPlaybooks.size} playbooks.`);
+          '
+
+      - name: Check shell scripts
+        run: |
+          bash -n skills/poteto-mode/scripts/worktree-audit.sh
+          bash -n skills/show-me-your-work/scripts/log.sh
+
+      - name: Install script dependencies
+        working-directory: skills/poteto-mode/scripts
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck scripts
+        working-directory: skills/poteto-mode/scripts
+        run: bun run typecheck
+
+      - name: Run script tests
+        working-directory: skills/poteto-mode/scripts
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: commit.gpgsign
+          GIT_CONFIG_VALUE_0: "false"
+        run: bun run test
